@@ -1,0 +1,12 @@
+# Secrets -- never track
+.env
+.env.*
+!.env.example
+
+# Cache / bytecode
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

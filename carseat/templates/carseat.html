@@ -1,0 +1,159 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CLLTE Car Seat (Shadow Mode)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        body { background: #0a0a0a; color: #d4af37; font-family: monospace; text-align: center; padding: 50px; }
+        button { background: #d4af37; color: #0a0a0a; border: none; padding: 15px 30px; font-size: 16px; cursor: pointer; font-weight: bold; margin: 10px; }
+        #status { margin-top: 20px; color: #888; }
+        #transcript { margin-top: 20px; color: #aaa; min-height: 40px; }
+        .sleeping { color: #ff5555; }
+    </style>
+</head>
+<body>
+    <h2>CLLTE Car Seat (Shadow Mode)</h2>
+    <button id="startBtn" onclick="startMic()">Start Listening</button>
+    <button id="stopBtn" onclick="stopMic()">Stop</button>
+    <div id="status">Waiting to connect...</div>
+    <div id="transcript"></div>
+    <p><small>F7 = stop Collette and let you finish</small></p>
+
+    <script>
+        const socket = io();
+        let mediaRecorder = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        let currentAudio = null;
+        let silenceTimer = null;
+        let audioContext = null;
+        let analyser = null;
+        let micStream = null;
+        let rafId = null;
+        let lastSpeechAt = Date.now();
+
+        socket.on('server_status', function (data) {
+            document.getElementById('status').innerText = data.msg;
+            document.getElementById('status').classList.remove('sleeping');
+        });
+
+        socket.on('auto_sleep', function (data) {
+            stopMic();
+            document.getElementById('status').innerText = data.msg;
+            document.getElementById('status').classList.add('sleeping');
+        });
+
+        socket.on('disconnect', function () {
+            document.getElementById('status').innerText = "Connection lost. Reconnecting to Collette...";
+            document.getElementById('status').style.color = "red";
+        });
+
+        socket.on('connect', function () {
+            document.getElementById('status').innerText = "Connected to Collette Car Seat";
+            document.getElementById('status').style.color = "#d4af37";
+        });
+
+        // --- Sequential audio playback queue ---
+        socket.on('audio_playback', function (data) {
+            const audioSrc = "data:audio/mp3;base64," + data.audio_b64;
+            audioQueue.push(audioSrc);
+            playNextInQueue();
+        });
+
+        function playNextInQueue() {
+            if (isPlaying || audioQueue.length === 0) return;
+            isPlaying = true;
+            currentAudio = new Audio(audioQueue.shift());
+            currentAudio.onended = function () {
+                isPlaying = false;
+                currentAudio = null;
+                playNextInQueue();
+            };
+            currentAudio.play();
+        }
+
+        // --- F7 Kill Switch ---
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'F7') {
+                event.preventDefault();
+                audioQueue = [];
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio.currentTime = 0;
+                    currentAudio = null;
+                }
+                isPlaying = false;
+                socket.emit('abort_speech');
+                document.getElementById('status').innerText = "Stopped (F7)";
+            }
+        });
+
+        // --- Volume monitoring for silence detection ---
+        let lastVolumeSent = 0;
+        function checkVolume() {
+            if (!analyser) return;
+            analyser.getByteFrequencyData(pcmData);
+            let sum = 0;
+            for (let i = 0; i < pcmData.length; i++) sum += pcmData[i];
+
+            // Report raw mic volume to the backend (~5x/sec) so it can
+            // detect loud effort bursts (stuck blocks) via hysteresis.
+            const now = Date.now();
+            if (now - lastVolumeSent > 200) {
+                lastVolumeSent = now;
+                socket.emit('volume', { level: sum });
+            }
+
+            if (sum > 100) {
+                lastSpeechAt = Date.now();
+                clearTimeout(silenceTimer);
+                silenceTimer = setTimeout(function () {
+                    socket.emit('speech_ended');
+                }, 1200);
+            }
+            rafId = requestAnimationFrame(checkVolume);
+        }
+        let pcmData = null;
+
+        async function startMic() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: true, noiseSuppression: true }
+                });
+                micStream = stream;
+
+                // Volume monitoring
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                analyser.minDecibels = -60;
+                const source = audioContext.createMediaStreamSource(stream);
+                source.connect(analyser);
+                pcmData = new Uint8Array(analyser.frequencyBinCount);
+                checkVolume();
+
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                mediaRecorder.ondataavailable = async function (event) {
+                    if (event.data.size > 0) {
+                        socket.emit('audio_chunk', await event.data.arrayBuffer());
+                    }
+                };
+                mediaRecorder.start(500);
+                document.getElementById('status').innerText = "Mic active. Streaming to Collette...";
+            } catch (err) {
+                console.error("Mic access denied:", err);
+                document.getElementById('status').innerText = "Microphone access denied.";
+            }
+        }
+
+        function stopMic() {
+            if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+            if (micStream) micStream.getTracks().forEach(function (t) { t.stop(); });
+            if (rafId) cancelAnimationFrame(rafId);
+            if (audioContext) audioContext.close();
+            mediaRecorder = null; micStream = null; audioContext = null; analyser = null;
+            document.getElementById('status').innerText = "Stream stopped.";
+        }
+    </script>
+</body>
+</html>
